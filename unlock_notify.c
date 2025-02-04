@@ -18,46 +18,108 @@
 #include <stdlib.h>
 #include "unlock_notify.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 SQLITE_EXTENSION_INIT3
 
-_unlock_note* _unlock_note_alloc() {
-	_unlock_note* un = (_unlock_note*)malloc(sizeof(_unlock_note));
-	pthread_mutex_init(&un->mu, 0);
-	pthread_cond_init(&un->cond, 0);
-	return un;
+static void _unlock_notify_cb(void **apArg, int nArg) {
+    int i;
+    for(i=0; i < nArg; i++) {
+        _unlock_note_fire((_unlock_note*)apArg[i]);
+    }
+}
+
+#ifdef _WIN32
+
+_unlock_note* _unlock_note_alloc(void) {
+    _unlock_note* un = (_unlock_note*)malloc(sizeof(_unlock_note));
+    if (un) {
+        InitializeCriticalSection(&un->mu);
+        InitializeConditionVariable(&un->cond);
+        un->fired = 0;
+    }
+    return un;
 }
 
 void _unlock_note_free(_unlock_note* un) {
-	pthread_cond_destroy(&un->cond);
-	pthread_mutex_destroy(&un->mu);
-	free(un);
+    if (un) {
+        DeleteCriticalSection(&un->mu);
+        free(un);
+    }
 }
 
 void _unlock_note_fire(_unlock_note* un) {
-	pthread_mutex_lock(&un->mu);
-	un->fired = 1;
-	pthread_cond_signal(&un->cond);
-	pthread_mutex_unlock(&un->mu);
-}
-
-static void _unlock_notify_cb(void **apArg, int nArg) {
-	for(int i=0; i < nArg; i++) {
-		_unlock_note_fire((_unlock_note*)apArg[i]);
-	}
+    if (un) {
+        EnterCriticalSection(&un->mu);
+        un->fired = 1;
+        WakeConditionVariable(&un->cond);
+        LeaveCriticalSection(&un->mu);
+    }
 }
 
 int _wait_for_unlock_notify(sqlite3 *db, _unlock_note* un) {
-	un->fired = 0;
+    if (!un) return SQLITE_ERROR;
+    
+    un->fired = 0;
+    int res = sqlite3_unlock_notify(db, _unlock_notify_cb, (void *)un);
 
-	int res = sqlite3_unlock_notify(db, _unlock_notify_cb, (void *)un);
+    if (res == SQLITE_OK) {
+        EnterCriticalSection(&un->mu);
+        while (!un->fired) {
+            SleepConditionVariableCS(&un->cond, &un->mu, INFINITE);
+        }
+        LeaveCriticalSection(&un->mu);
+    }
 
-	if (res == SQLITE_OK) {
-		pthread_mutex_lock(&un->mu);
-		if (!un->fired) {
-			pthread_cond_wait(&un->cond, &un->mu);
-		}
-		pthread_mutex_unlock(&un->mu);
-	}
-
-	return res;
+    return res;
 }
+
+#else
+
+_unlock_note* _unlock_note_alloc(void) {
+    _unlock_note* un = (_unlock_note*)malloc(sizeof(_unlock_note));
+    if (un) {
+        pthread_mutex_init(&un->mu, 0);
+        pthread_cond_init(&un->cond, 0);
+        un->fired = 0;
+    }
+    return un;
+}
+
+void _unlock_note_free(_unlock_note* un) {
+    if (un) {
+        pthread_cond_destroy(&un->cond);
+        pthread_mutex_destroy(&un->mu);
+        free(un);
+    }
+}
+
+void _unlock_note_fire(_unlock_note* un) {
+    if (un) {
+        pthread_mutex_lock(&un->mu);
+        un->fired = 1;
+        pthread_cond_signal(&un->cond);
+        pthread_mutex_unlock(&un->mu);
+    }
+}
+
+int _wait_for_unlock_notify(sqlite3 *db, _unlock_note* un) {
+    if (!un) return SQLITE_ERROR;
+
+    un->fired = 0;
+    int res = sqlite3_unlock_notify(db, _unlock_notify_cb, (void *)un);
+
+    if (res == SQLITE_OK) {
+        pthread_mutex_lock(&un->mu);
+        if (!un->fired) {
+            pthread_cond_wait(&un->cond, &un->mu);
+        }
+        pthread_mutex_unlock(&un->mu);
+    }
+
+    return res;
+}
+
+#endif
